@@ -2,20 +2,23 @@
 
 namespace Drupal\consumer_image_styles\Normalizer;
 
-use Drupal\consumer_image_styles\ImageStylesProviderInterface;
-use Drupal\consumer_image_styles\Normalizer\Value\ImageVariantItemNormalizerValue;
-use Drupal\consumer_image_styles\Normalizer\Value\ImageNormalizerValue;
+use Drupal\consumer_image_styles\ImageStylesProvider;
 use Drupal\consumers\Negotiator;
+use Drupal\Core\Cache\RefinableCacheableDependencyInterface;
 use Drupal\Core\Entity\EntityInterface;
-use Drupal\Core\Entity\EntityTypeManagerInterface;
+use Drupal\Core\Image\ImageFactory;
 use Drupal\file\Entity\File;
 use Drupal\Core\Cache\CacheableMetadata;
-use Drupal\jsonapi\LinkManager\LinkManager;
-use Drupal\jsonapi\Normalizer\ContentEntityNormalizer;
-use Drupal\jsonapi\Normalizer\Value\NullFieldNormalizerValue;
-use Drupal\jsonapi\ResourceType\ResourceTypeRepositoryInterface;
+use Drupal\image\ImageStyleInterface;
+use Drupal\jsonapi\Normalizer\NormalizerBase;
+use Drupal\jsonapi\Normalizer\Value\CacheableNormalization;
+use Drupal\jsonapi\Normalizer\Value\CacheableOmission;
+use Symfony\Component\Serializer\Normalizer\DenormalizerInterface;
+use Symfony\Component\Serializer\Normalizer\NormalizerInterface;
+use Symfony\Component\Serializer\SerializerAwareInterface;
+use Symfony\Component\Serializer\SerializerInterface;
 
-class ImageEntityNormalizer extends ContentEntityNormalizer {
+class ImageEntityNormalizer extends NormalizerBase implements DenormalizerInterface {
 
   /**
    * The interface or class that this Normalizer supports.
@@ -32,67 +35,69 @@ class ImageEntityNormalizer extends ContentEntityNormalizer {
   protected $formats = ['api_json'];
 
   /**
-   * The link manager.
-   *
-   * @var \Drupal\jsonapi\LinkManager\LinkManager
-   */
-  protected $linkManager;
-
-  /**
-   * The JSON API resource type repository.
-   *
-   * @var \Drupal\jsonapi\ResourceType\ResourceTypeRepositoryInterface
-   */
-  protected $resourceTypeRepository;
-
-  /**
-   * The entity type manager.
-   *
-   * @var \Drupal\Core\Entity\EntityTypeManagerInterface
-   */
-  protected $entityTypeManager;
-
-  /**
    * @var \Drupal\consumers\Negotiator
    */
   protected $consumerNegotiator;
 
   /**
-   * @var \Drupal\consumer_image_styles\ImageStylesProviderInterface
+   * @var \Drupal\consumer_image_styles\ImageStylesProvider
    */
   protected $imageStylesProvider;
 
   /**
+   * @var \Drupal\Core\Image\ImageFactory
+   */
+  protected $imageFactory;
+
+  /**
+   * @var \Symfony\Component\Serializer\Normalizer\NormalizerInterface
+   */
+  protected $subject;
+
+  /**
    * Constructs an EntityNormalizer object.
    *
-   * @param \Drupal\jsonapi\LinkManager\LinkManager $link_manager
-   *   The link manager.
-   * @param \Drupal\jsonapi\ResourceType\ResourceTypeRepositoryInterface $resource_type_repository
-   *   The JSON API resource type repository.
-   * @param \Drupal\Core\Entity\EntityTypeManagerInterface $entity_type_manager
-   *   The entity type manager.
+   * @param \Symfony\Component\Serializer\Normalizer\NormalizerInterface $subject
+   *   The decorated service.
    * @param \Drupal\consumers\Negotiator $consumer_negotiator
    *   The consumer negotiator.
-   * @param \Drupal\consumer_image_styles\ImageStylesProviderInterface
+   * @param \Drupal\consumer_image_styles\ImageStylesProvider
    *   Image styles utility.
+   * @param \Drupal\Core\Image\ImageFactory $image_factory
+   *   The image factory.
    */
-  public function __construct(LinkManager $link_manager, ResourceTypeRepositoryInterface $resource_type_repository, EntityTypeManagerInterface $entity_type_manager, Negotiator $consumer_negotiator, ImageStylesProviderInterface $imageStylesProvider) {
-    parent::__construct($link_manager, $resource_type_repository, $entity_type_manager);
+  public function __construct(NormalizerInterface $subject, Negotiator $consumer_negotiator, ImageStylesProvider $imageStylesProvider, ImageFactory $image_factory) {
+    $this->subject = $subject;
     $this->consumerNegotiator = $consumer_negotiator;
     $this->imageStylesProvider = $imageStylesProvider;
+    $this->imageFactory = $image_factory;
   }
 
   /**
    * {@inheritdoc}
    */
+  public function setSerializer(SerializerInterface $serializer) {
+    if ($this->serializer) {
+      return;
+    }
+    parent::setSerializer($serializer);
+    if (!$this->subject instanceof SerializerAwareInterface) {
+      return;
+    }
+    $this->subject->setSerializer($serializer);
+  }
+
+
+  /**
+   * {@inheritdoc}
+   */
   public function supportsNormalization($data, $format = NULL) {
-    // It is very tricky to detect if a file entity is an image or not. This is
-    // typically done using a special field type to point to this entity.
-    // However we don't have access to that in here. Besides we want this to
-    // apply when requesting a listing of file entities as well, not only via
-    // includes. For all this we'll do string matching against the mimetype.
-    return parent::supportsNormalization($data, $format) &&
-      strpos($data->get('filemime')->value, 'image/') !== FALSE;
+    if (!parent::supportsNormalization($data, $format)) {
+      return FALSE;
+    }
+    /** @var \Drupal\file\Entity\File $data */
+    $image = $this->imageFactory->get($data->getFileUri());
+    return $image->isValid();
   }
 
   /**
@@ -108,10 +113,21 @@ class ImageEntityNormalizer extends ContentEntityNormalizer {
    * {@inheritdoc}
    */
   public function normalize($entity, $format = NULL, array $context = []) {
-    $file_entity_values = parent::normalize($entity, $format, $context);
-    $variants = $this->buildVariantValues($entity, $context);
+    /** @var \Drupal\jsonapi\Normalizer\Value\CacheableNormalization $normalized_output */
+    $normalized_output = $this->subject->normalize($entity, $format, $context);
+    $variants = $this->buildVariantLinks($entity, $context);
+    if ($variants instanceof CacheableOmission) {
+      return $normalized_output;
+    }
 
-    return new ImageNormalizerValue($variants, $file_entity_values);
+    $cacheability = CacheableMetadata::createFromObject($normalized_output);
+    $cacheability->merge(CacheableMetadata::createFromObject($variants));
+    $normalization = array_merge_recursive(
+      $normalized_output->getNormalization(),
+      ['links' => $variants->getNormalization()]
+    );
+
+    return new CacheableNormalization($cacheability, $normalization);
   }
 
   /**
@@ -126,31 +142,54 @@ class ImageEntityNormalizer extends ContentEntityNormalizer {
    * @param \Drupal\Core\Entity\EntityInterface $entity
    * @param array $context
    *
-   * @return \Drupal\jsonapi\Normalizer\Value\ValueExtractorInterface
+   * @return \Drupal\jsonapi\Normalizer\Value\CacheableNormalization
+   *   The normalization.
    */
-  protected function buildVariantValues(EntityInterface $entity, array $context = []) {
+  protected function buildVariantLinks(EntityInterface $entity, array $context = []) {
     $request = empty($context['request']) ? NULL : $context['request'];
     $consumer = $this->consumerNegotiator->negotiateFromRequest($request);
+    $access = $entity->access('view', $context['account'], TRUE);
+    $cacheability = CacheableMetadata::createFromObject($access)
+      ->addCacheableDependency($entity);
 
     // Bail-out if no consumer is found.
     if (!$consumer) {
-      $access = $entity->access('view', $context['account'], TRUE);
-      return new NullFieldNormalizerValue($access, 'attributes');
+      return new CacheableOmission($cacheability);
+    }
+    // If the entity cannot be loaded or it's not an image, do not enhance it.
+    if (!$this->imageStylesProvider->entityIsImage($entity)) {
+      return new CacheableOmission($cacheability);
+    }
+    /** @var \Drupal\file\Entity\File $entity */
+    // If the entity is not viewable
+    if (!$access->isAllowed()) {
+      return new CacheableOmission($cacheability);
     }
 
     // Prepare some utils.
-    $uri = $entity->get('uri')->value;
-    $get_image_url = function($image_style) use ($uri) {
-      return file_create_url($image_style->buildUrl($uri));
-    };
-
+    $uri = $entity->getFileUri();
     // Generate derivatives only for the found ones.
     $image_styles = $this->imageStylesProvider->loadStyles($consumer);
     $keys = array_keys($image_styles);
-    $values = array_map($get_image_url, array_values($image_styles));
+    $values = array_map(
+      function(ImageStyleInterface $image_style) use ($uri) {
+        return $this->imageStylesProvider->buildDerivativeLink($uri, $image_style);
+      },
+      array_values($image_styles)
+    );
     $value = array_combine($keys, $values);
 
-    return new ImageVariantItemNormalizerValue($value, new CacheableMetadata());
+    $extra_cacheability = array_reduce(
+      $image_styles,
+      function (RefinableCacheableDependencyInterface $cacheable, ImageStyleInterface $image_style) {
+        return $cacheable->addCacheableDependency($image_style);
+      },
+      new CacheableMetadata()
+    );
+    return new CacheableNormalization(
+      $cacheability->merge($extra_cacheability),
+      $value
+    );
   }
 
 }
